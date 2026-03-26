@@ -442,10 +442,32 @@ input[type="range"]::-moz-range-thumb {
 <!-- MAPPER TAB -->
 <div class="tab-panel" id="tab-mapper" role="tabpanel">
   <div class="card">
+    <h3>Mapper Controls</h3>
+    <div class="grid-3">
+      <div>
+        <label for="lensSelect">Lens Function</label>
+        <select id="lensSelect">
+          <option value="pc1">PC1 (default)</option>
+          <option value="yi">Effect size (yi)</option>
+          <option value="sei">Standard error (sei)</option>
+        </select>
+      </div>
+      <div>
+        <label for="binsSlider">Bins: <span id="binsLabel">10</span></label>
+        <input type="range" id="binsSlider" min="5" max="20" value="10">
+      </div>
+      <div>
+        <label for="overlapSlider">Overlap: <span id="overlapLabel">50%</span></label>
+        <input type="range" id="overlapSlider" min="25" max="75" value="50">
+      </div>
+    </div>
+  </div>
+  <div class="card">
     <h3>Mapper Graph</h3>
-    <p>Mapper visualization will appear here after running TDA on the Data tab.</p>
-    <div class="canvas-container" style="height: 500px;">
+    <p id="mapperPlaceholder">Mapper visualization will appear here after running TDA on the Data tab.</p>
+    <div class="canvas-container" style="height: 500px; position: relative;">
       <canvas id="mapperCanvas"></canvas>
+      <div id="mapperTooltip" style="display:none; position:absolute; background:var(--card-bg); border:1px solid var(--border); border-radius:4px; padding:8px 12px; font-size:0.82rem; pointer-events:none; z-index:50; box-shadow:0 2px 8px rgba(0,0,0,0.15); max-width:260px;"></div>
     </div>
   </div>
 </div>
@@ -454,10 +476,14 @@ input[type="range"]::-moz-range-thumb {
 <div class="tab-panel" id="tab-persistence" role="tabpanel">
   <div class="card">
     <h3>Persistent Homology</h3>
-    <p>Persistence diagrams and barcodes will appear here after running TDA.</p>
+    <p id="persistPlaceholder">Persistence diagrams and barcodes will appear here after running TDA.</p>
+    <div class="flex-row mb-8">
+      <button class="btn btn-sm" id="togglePersistView" disabled>Show Persistence Diagram</button>
+    </div>
     <div class="canvas-container" style="height: 400px;">
       <canvas id="persistenceCanvas"></canvas>
     </div>
+    <div id="persistSummary" class="mt-8"></div>
   </div>
 </div>
 
@@ -465,8 +491,11 @@ input[type="range"]::-moz-range-thumb {
 <div class="tab-panel" id="tab-subgroups" role="tabpanel">
   <div class="card">
     <h3>Topological Subgroups</h3>
-    <p>Subgroup analysis results will appear here after running TDA.</p>
-    <div id="subgroupResults"></div>
+    <p id="subgroupPlaceholder">Subgroup analysis results will appear here after running TDA.</p>
+    <div id="subgroupSummary"></div>
+    <div id="subgroupTable" class="mt-16"></div>
+    <div id="subgroupCovariates" class="mt-16"></div>
+    <div id="subgroupForests" class="mt-16"></div>
   </div>
 </div>
 
@@ -474,11 +503,16 @@ input[type="range"]::-moz-range-thumb {
 <div class="tab-panel" id="tab-export" role="tabpanel">
   <div class="card">
     <h3>Export Results</h3>
-    <p>Export options will be available after running TDA analysis.</p>
+    <p id="exportPlaceholder">Export options will be available after running TDA analysis.</p>
     <div class="flex-row mt-8">
-      <button class="btn" disabled>Export CSV</button>
-      <button class="btn" disabled>Export JSON</button>
-      <button class="btn" disabled>Export R Script</button>
+      <button class="btn" id="exportCsvBtn" disabled>Export CSV</button>
+      <button class="btn" id="exportJsonBtn" disabled>Export JSON</button>
+      <button class="btn" id="exportRBtn" disabled>Export R Script</button>
+      <button class="btn" id="exportPngBtn" disabled>Export PNG (Mapper)</button>
+    </div>
+    <div id="exportRCode" class="mt-16" style="display:none;">
+      <h3>R Script Preview</h3>
+      <textarea id="rCodePreview" rows="20" readonly style="width:100%;"></textarea>
     </div>
   </div>
 </div>
@@ -1433,6 +1467,627 @@ function getConnectedComponents(graph) {
 }
 
 
+// ===== META-ANALYSIS ENGINE =====
+
+function normalCDF(x) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989422804014327;
+  const p = d * Math.exp(-x * x / 2) * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.8212560 + t * 1.3302744))));
+  return x > 0 ? 1 - p : p;
+}
+
+function chi2CDF(x, df) {
+  if (x <= 0) return 0;
+  if (df <= 0) return 0;
+  // Wilson-Hilferty approximation
+  const z = Math.pow(x / df, 1 / 3) - (1 - 2 / (9 * df));
+  const se = Math.sqrt(2 / (9 * df));
+  return normalCDF(z / se);
+}
+
+function dlPooled(yi, vi) {
+  const k = yi.length;
+  if (k === 0) return null;
+  if (k === 1) {
+    const se1 = Math.sqrt(vi[0]);
+    const z1 = se1 > 0 ? yi[0] / se1 : 0;
+    return {
+      theta: yi[0], se: se1, tau2: 0, Q: 0, I2: 0,
+      ci: [yi[0] - 1.96 * se1, yi[0] + 1.96 * se1],
+      p: se1 > 0 ? 2 * (1 - normalCDF(Math.abs(z1))) : 1,
+      k: 1
+    };
+  }
+  const w = vi.map(v => v > 0 ? 1 / v : 0);
+  const sumW = w.reduce((a, b) => a + b, 0);
+  if (sumW === 0) return null;
+  const thetaFE = w.reduce((s, wi, i) => s + wi * yi[i], 0) / sumW;
+  const Q = w.reduce((s, wi, i) => s + wi * (yi[i] - thetaFE) ** 2, 0);
+  const C = sumW - w.reduce((s, wi) => s + wi * wi, 0) / sumW;
+  const tau2 = C > 0 ? Math.max(0, (Q - (k - 1)) / C) : 0;
+  const wRE = vi.map(v => 1 / (v + tau2));
+  const sumWRE = wRE.reduce((a, b) => a + b, 0);
+  const theta = wRE.reduce((s, wi, i) => s + wi * yi[i], 0) / sumWRE;
+  const se = Math.sqrt(1 / sumWRE);
+  const z = se > 0 ? theta / se : 0;
+  const p = se > 0 ? 2 * (1 - normalCDF(Math.abs(z))) : 1;
+  const I2 = Q > (k - 1) ? Math.max(0, (Q - (k - 1)) / Q) * 100 : 0;
+  return { theta, se, tau2, Q, I2, ci: [theta - 1.96 * se, theta + 1.96 * se], p, k };
+}
+
+function betweenGroupQ(groups) {
+  const allYi = groups.flatMap(g => g.yi);
+  const allVi = groups.flatMap(g => g.vi);
+  const overall = dlPooled(allYi, allVi);
+  if (!overall) return { Q: 0, df: 0, p: 1, groupResults: [], overall: null };
+  const groupResults = groups.map(g => dlPooled(g.yi, g.vi));
+  const Qwithin = groupResults.reduce((s, r) => s + ((r != null ? r.Q : 0) ?? 0), 0);
+  const Qbetween = Math.max(0, overall.Q - Qwithin);
+  const df = groups.length - 1;
+  const p = df > 0 ? 1 - chi2CDF(Qbetween, df) : 1;
+  return { Q: Qbetween, df, p, groupResults, overall };
+}
+
+
+// ===== VISUALIZATION ENGINE =====
+
+// --- Debounce utility ---
+function debounce(fn, ms) {
+  let timer = null;
+  return function(...args) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), ms);
+  };
+}
+
+// --- Toast notification ---
+function showToast(msg, durationMs) {
+  let toast = document.getElementById('tdaToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'tdaToast';
+    toast.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:10px 24px;border-radius:6px;font-size:0.9rem;z-index:2000;opacity:0;transition:opacity 0.3s;pointer-events:none;';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.style.opacity = '1';
+  setTimeout(() => { toast.style.opacity = '0'; }, durationMs ?? 3000);
+}
+
+// --- Color interpolation: blue -> white -> red ---
+function effectColor(val, minVal, maxVal) {
+  // val normalized to [-1, 1] range
+  const range = maxVal - minVal;
+  const t = range > 0 ? (val - minVal) / range * 2 - 1 : 0; // -1 to 1
+  if (t <= 0) {
+    // blue (#3b82f6) to white
+    const f = 1 + t; // 0 to 1
+    const r = Math.round(59 + (255 - 59) * f);
+    const g = Math.round(130 + (255 - 130) * f);
+    const b = Math.round(246 + (255 - 246) * f);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  } else {
+    // white to red (#ef4444)
+    const f = t; // 0 to 1
+    const r = Math.round(255 + (239 - 255) * f);
+    const g = Math.round(255 + (68 - 255) * f);
+    const b = Math.round(255 + (68 - 255) * f);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+}
+
+// --- Fruchterman-Reingold force-directed layout ---
+function forceDirectedLayout(nodes, edges, width, height) {
+  const k = nodes.length;
+  if (k === 0) return [];
+  if (k === 1) return [{ x: width / 2, y: height / 2 }];
+
+  const area = width * height;
+  const kForce = Math.sqrt(area / k);
+  const rng = xoshiro128ss(999);
+
+  // Initialize random positions
+  const pos = nodes.map(() => ({
+    x: 40 + rng() * (width - 80),
+    y: 40 + rng() * (height - 80)
+  }));
+
+  let temp = width / 10;
+  const cooling = 0.97;
+  const iterations = 200;
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const disp = pos.map(() => ({ x: 0, y: 0 }));
+
+    // Repulsion (Coulomb) between all pairs
+    for (let i = 0; i < k; i++) {
+      for (let j = i + 1; j < k; j++) {
+        let dx = pos[i].x - pos[j].x;
+        let dy = pos[i].y - pos[j].y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 0.01) dist = 0.01;
+        const force = kForce * kForce / dist;
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        disp[i].x += fx;
+        disp[i].y += fy;
+        disp[j].x -= fx;
+        disp[j].y -= fy;
+      }
+    }
+
+    // Attraction (Hooke) along edges
+    for (const edge of edges) {
+      const i = edge.source;
+      const j = edge.target;
+      let dx = pos[i].x - pos[j].x;
+      let dy = pos[i].y - pos[j].y;
+      let dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 0.01) dist = 0.01;
+      const force = dist * dist / kForce;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      disp[i].x -= fx;
+      disp[i].y -= fy;
+      disp[j].x += fx;
+      disp[j].y += fy;
+    }
+
+    // Apply displacement with temperature limit
+    for (let i = 0; i < k; i++) {
+      const len = Math.sqrt(disp[i].x ** 2 + disp[i].y ** 2);
+      if (len > 0) {
+        const scale = Math.min(len, temp) / len;
+        pos[i].x += disp[i].x * scale;
+        pos[i].y += disp[i].y * scale;
+      }
+      // Clamp to bounds
+      pos[i].x = Math.max(40, Math.min(width - 40, pos[i].x));
+      pos[i].y = Math.max(40, Math.min(height - 40, pos[i].y));
+    }
+
+    temp *= cooling;
+  }
+
+  return pos;
+}
+
+// --- Render Mapper graph ---
+function renderMapperGraph(canvas, graph, studies) {
+  const ctx = canvas.getContext('2d');
+  const container = canvas.parentElement;
+  const dpr = window.devicePixelRatio ?? 1;
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  ctx.clearRect(0, 0, w, h);
+
+  if (!graph || graph.nodes.length === 0) {
+    ctx.fillStyle = 'var(--muted)';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No mapper graph to display', w / 2, h / 2);
+    return { positions: [], graph };
+  }
+
+  const positions = forceDirectedLayout(graph.nodes, graph.edges, w, h);
+
+  // Compute effect range for coloring
+  const effects = graph.nodes.map(n => n.meanEffect);
+  const minE = Math.min(...effects);
+  const maxE = Math.max(...effects);
+
+  // Draw edges
+  for (const edge of graph.edges) {
+    const p1 = positions[edge.source];
+    const p2 = positions[edge.target];
+    const thickness = Math.min(6, 1 + (edge.sharedCount ?? 1));
+    ctx.beginPath();
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.strokeStyle = '#999';
+    ctx.lineWidth = thickness;
+    ctx.globalAlpha = 0.5;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // Draw nodes
+  for (let i = 0; i < graph.nodes.length; i++) {
+    const node = graph.nodes[i];
+    const pos = positions[i];
+    const radius = Math.max(8, Math.min(40, Math.sqrt(node.studies.length) * 10));
+    const color = effectColor(node.meanEffect, minE, maxE);
+
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, radius, 0, 2 * Math.PI);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Label: node id + study count
+    ctx.fillStyle = '#333';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('n=' + node.studies.length, pos.x, pos.y + 4);
+  }
+
+  return { positions, graph };
+}
+
+// --- Render persistence barcode ---
+function renderBarcode(canvas, persistence) {
+  const ctx = canvas.getContext('2d');
+  const container = canvas.parentElement;
+  const dpr = window.devicePixelRatio ?? 1;
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  if (!persistence) return;
+
+  const allFeatures = [
+    ...persistence.h0.filter(f => isFinite(f.death)).map(f => ({ ...f, dim: 0 })),
+    ...persistence.h1.map(f => ({ ...f, dim: 1 }))
+  ];
+
+  if (allFeatures.length === 0) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No persistence features to display', w / 2, h / 2);
+    return;
+  }
+
+  const maxDeath = Math.max(...allFeatures.map(f => f.death));
+  const padL = 60, padR = 30, padT = 30, padB = 50;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const barH = Math.max(2, Math.min(12, plotH / allFeatures.length - 1));
+  const scaleX = v => padL + (v / maxDeath) * plotW;
+
+  // Axis
+  ctx.strokeStyle = '#6b7280';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, h - padB);
+  ctx.lineTo(w - padR, h - padB);
+  ctx.stroke();
+
+  // X-axis ticks
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  const nTicks = 5;
+  for (let i = 0; i <= nTicks; i++) {
+    const val = (i / nTicks) * maxDeath;
+    const x = scaleX(val);
+    ctx.beginPath();
+    ctx.moveTo(x, h - padB);
+    ctx.lineTo(x, h - padB + 5);
+    ctx.stroke();
+    ctx.fillText(val.toFixed(2), x, h - padB + 18);
+  }
+  ctx.fillText('Filtration value (epsilon)', w / 2, h - 5);
+
+  // Y-axis label
+  ctx.save();
+  ctx.translate(15, h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center';
+  ctx.fillText('Features', 0, 0);
+  ctx.restore();
+
+  // Draw bars
+  const h0Color = '#3b82f6';
+  const h1Color = '#f97316';
+
+  for (let i = 0; i < allFeatures.length; i++) {
+    const f = allFeatures[i];
+    const y = padT + i * (barH + 1);
+    const x1 = scaleX(f.birth);
+    const x2 = scaleX(f.death);
+    const thick = f.significant ? 4 : 1;
+
+    ctx.fillStyle = f.dim === 0 ? h0Color : h1Color;
+    ctx.fillRect(x1, y - thick / 2, Math.max(1, x2 - x1), thick);
+
+    if (f.significant) {
+      ctx.fillStyle = '#333';
+      ctx.font = '9px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText((f.dim === 0 ? 'H0' : 'H1') + ' p=' + f.persistence.toFixed(3), x2 + 3, y + 3);
+    }
+  }
+
+  // Legend
+  ctx.fillStyle = h0Color;
+  ctx.fillRect(padL + 10, padT - 20, 20, 4);
+  ctx.fillStyle = '#333';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('H0 (components)', padL + 35, padT - 16);
+
+  ctx.fillStyle = h1Color;
+  ctx.fillRect(padL + 170, padT - 20, 20, 4);
+  ctx.fillStyle = '#333';
+  ctx.fillText('H1 (loops)', padL + 195, padT - 16);
+}
+
+// --- Render persistence diagram (scatter: birth vs death) ---
+function renderPersistenceDiagram(canvas, persistence) {
+  const ctx = canvas.getContext('2d');
+  const container = canvas.parentElement;
+  const dpr = window.devicePixelRatio ?? 1;
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  if (!persistence) return;
+
+  const allFeatures = [
+    ...persistence.h0.filter(f => isFinite(f.death)).map(f => ({ ...f, dim: 0 })),
+    ...persistence.h1.map(f => ({ ...f, dim: 1 }))
+  ];
+
+  if (allFeatures.length === 0) return;
+
+  const maxVal = Math.max(...allFeatures.map(f => Math.max(f.birth, f.death)));
+  const padL = 60, padR = 30, padT = 30, padB = 50;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const scaleX = v => padL + (v / maxVal) * plotW;
+  const scaleY = v => h - padB - (v / maxVal) * plotH;
+
+  // Axes
+  ctx.strokeStyle = '#6b7280';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, h - padB);
+  ctx.lineTo(w - padR, h - padB);
+  ctx.stroke();
+
+  // Diagonal line
+  ctx.strokeStyle = '#d1d5db';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(scaleX(0), scaleY(0));
+  ctx.lineTo(scaleX(maxVal), scaleY(maxVal));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Axis labels
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Birth', w / 2, h - 5);
+  ctx.save();
+  ctx.translate(15, h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('Death', 0, 0);
+  ctx.restore();
+
+  // Tick marks
+  const nTicks = 5;
+  for (let i = 0; i <= nTicks; i++) {
+    const val = (i / nTicks) * maxVal;
+    // X tick
+    ctx.beginPath();
+    ctx.moveTo(scaleX(val), h - padB);
+    ctx.lineTo(scaleX(val), h - padB + 5);
+    ctx.strokeStyle = '#6b7280';
+    ctx.stroke();
+    ctx.fillText(val.toFixed(2), scaleX(val), h - padB + 18);
+    // Y tick
+    ctx.beginPath();
+    ctx.moveTo(padL - 5, scaleY(val));
+    ctx.lineTo(padL, scaleY(val));
+    ctx.stroke();
+    ctx.textAlign = 'right';
+    ctx.fillText(val.toFixed(2), padL - 8, scaleY(val) + 4);
+    ctx.textAlign = 'center';
+  }
+
+  // Dots
+  const h0Color = '#3b82f6';
+  const h1Color = '#f97316';
+  for (const f of allFeatures) {
+    const r = f.significant ? 6 : 4;
+    ctx.beginPath();
+    ctx.arc(scaleX(f.birth), scaleY(f.death), r, 0, 2 * Math.PI);
+    ctx.fillStyle = f.dim === 0 ? h0Color : h1Color;
+    ctx.fill();
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Legend
+  ctx.fillStyle = h0Color;
+  ctx.beginPath();
+  ctx.arc(padL + 20, padT - 12, 5, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.fillStyle = '#333';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('H0', padL + 30, padT - 8);
+
+  ctx.fillStyle = h1Color;
+  ctx.beginPath();
+  ctx.arc(padL + 70, padT - 12, 5, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.fillStyle = '#333';
+  ctx.fillText('H1', padL + 80, padT - 8);
+}
+
+// --- Render forest plot for a cluster on a canvas ---
+function renderForestPlot(canvas, clusterStudies, pooled, clusterLabel) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio ?? 1;
+  const k = clusterStudies.length;
+  const rowH = 28;
+  const padT = 50, padB = 40, padL = 180, padR = 200;
+  const totalH = padT + (k + 1) * rowH + padB;
+  const w = canvas.parentElement ? canvas.parentElement.clientWidth : 700;
+
+  canvas.width = w * dpr;
+  canvas.height = totalH * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = totalH + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, totalH);
+
+  // Compute plot range
+  const allVals = [];
+  for (const s of clusterStudies) {
+    const lo = s.yi - 1.96 * s.sei;
+    const hi = s.yi + 1.96 * s.sei;
+    allVals.push(lo, hi);
+  }
+  if (pooled) {
+    allVals.push(pooled.ci[0], pooled.ci[1]);
+  }
+  let plotMin = Math.min(...allVals, 0);
+  let plotMax = Math.max(...allVals, 0);
+  const plotRange = plotMax - plotMin;
+  plotMin -= plotRange * 0.1;
+  plotMax += plotRange * 0.1;
+
+  const plotW = w - padL - padR;
+  const scaleX = v => padL + ((v - plotMin) / (plotMax - plotMin)) * plotW;
+
+  // Title
+  ctx.fillStyle = '#2563eb';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(clusterLabel, padL, 20);
+
+  // Column headers
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Study', 10, 40);
+  ctx.textAlign = 'center';
+  ctx.fillText('Effect [95% CI]', w - padR / 2, 40);
+
+  // Null line at 0
+  const nullX = scaleX(0);
+  ctx.strokeStyle = '#9ca3af';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(nullX, padT);
+  ctx.lineTo(nullX, padT + (k + 1) * rowH);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Study rows
+  for (let i = 0; i < k; i++) {
+    const s = clusterStudies[i];
+    const y = padT + (i + 0.5) * rowH;
+    const lo = s.yi - 1.96 * s.sei;
+    const hi = s.yi + 1.96 * s.sei;
+    const weight = s.sei > 0 ? 1 / (s.sei * s.sei) : 1;
+
+    // Study label
+    ctx.fillStyle = '#1a1a2e';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    const label = s.study ?? ('Study ' + (i + 1));
+    ctx.fillText(label.substring(0, 22), 10, y + 4);
+
+    // CI line
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(scaleX(lo), y);
+    ctx.lineTo(scaleX(hi), y);
+    ctx.stroke();
+
+    // Square at point estimate (size proportional to weight)
+    const sqSize = Math.max(4, Math.min(14, Math.sqrt(weight) * 2));
+    ctx.fillStyle = '#2563eb';
+    ctx.fillRect(scaleX(s.yi) - sqSize / 2, y - sqSize / 2, sqSize, sqSize);
+
+    // Right column: effect [CI]
+    ctx.fillStyle = '#1a1a2e';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(s.yi.toFixed(3) + ' [' + lo.toFixed(3) + ', ' + hi.toFixed(3) + ']', w - padR / 2, y + 4);
+  }
+
+  // Pooled diamond
+  if (pooled && pooled.k > 0) {
+    const y = padT + (k + 0.5) * rowH;
+
+    // Separator line
+    ctx.strokeStyle = '#d1d5db';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, y - rowH / 2);
+    ctx.lineTo(w - padR, y - rowH / 2);
+    ctx.stroke();
+
+    // Diamond
+    const cx = scaleX(pooled.theta);
+    const lx = scaleX(pooled.ci[0]);
+    const rx = scaleX(pooled.ci[1]);
+    ctx.fillStyle = '#dc2626';
+    ctx.beginPath();
+    ctx.moveTo(cx, y - 8);
+    ctx.lineTo(rx, y);
+    ctx.lineTo(cx, y + 8);
+    ctx.lineTo(lx, y);
+    ctx.closePath();
+    ctx.fill();
+
+    // Label
+    ctx.fillStyle = '#dc2626';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('Pooled (DL)', 10, y + 4);
+
+    ctx.fillStyle = '#dc2626';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(pooled.theta.toFixed(3) + ' [' + pooled.ci[0].toFixed(3) + ', ' + pooled.ci[1].toFixed(3) + ']', w - padR / 2, y + 4);
+  }
+
+  // Stats annotation below
+  if (pooled && pooled.k > 1) {
+    const annY = padT + (k + 1) * rowH + 20;
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('I\u00B2 = ' + pooled.I2.toFixed(1) + '%, \u03C4\u00B2 = ' + pooled.tau2.toFixed(4) + ', Q = ' + pooled.Q.toFixed(2) + ', p = ' + pooled.p.toFixed(4), padL, annY);
+  }
+}
+
+
+// ===== GLOBAL TDA STATE =====
+let tdaResults = null; // Stores full results after Run TDA
+let persistViewMode = 'barcode'; // 'barcode' or 'diagram'
+
 // ===== DATA MODULE STATE =====
 let currentStudies = [];
 let currentDatasetKey = 'bcg';
@@ -1482,6 +2137,7 @@ function loadDataset(key) {
 
   const numCols = getNumericColumns(currentStudies);
   updateDimensionCheckboxes(numCols);
+  updateLensOptions();
   runBtn.disabled = false;
 }
 
@@ -1561,6 +2217,22 @@ function initTabs() {
       btn.setAttribute('aria-selected', 'true');
       const panel = document.getElementById(tabId);
       if (panel) panel.classList.add('active');
+
+      // Re-render canvases when their tab becomes visible
+      if (tdaResults) {
+        setTimeout(() => {
+          if (tabId === 'tab-mapper') {
+            const res = renderMapperGraph(document.getElementById('mapperCanvas'), tdaResults.mapperGraph, tdaResults.studies);
+            tdaResults._mapperPositions = res.positions;
+          } else if (tabId === 'tab-persistence') {
+            const canvas = document.getElementById('persistenceCanvas');
+            if (persistViewMode === 'barcode') renderBarcode(canvas, tdaResults.persistence);
+            else renderPersistenceDiagram(canvas, tdaResults.persistence);
+          } else if (tabId === 'tab-subgroups') {
+            rerenderForestPlots();
+          }
+        }, 20);
+      }
     });
   });
 }
@@ -1610,49 +2282,638 @@ function initDataTab() {
     }
   });
 
-  // Run TDA button (placeholder for now)
+  // Run TDA button — full pipeline
   document.getElementById('runTdaBtn').addEventListener('click', () => {
-    const dims = getSelectedDimensions();
-    const statusEl = document.getElementById('tdaStatus');
-    if (dims.length < 1) {
-      statusEl.textContent = 'Select at least 1 dimension.';
-      statusEl.style.color = 'var(--red)';
-      return;
-    }
-    if (currentStudies.length < 3) {
-      statusEl.textContent = 'Need at least 3 studies.';
-      statusEl.style.color = 'var(--red)';
-      return;
-    }
-
-    const metric = document.querySelector('input[name="distMetric"]:checked').value;
-    const zscores = standardize(currentStudies, dims);
-    const distMatrix = metric === 'mahalanobis'
-      ? mahalanobisDistanceMatrix(zscores)
-      : euclideanDistanceMatrix(zscores);
-
-    // Run persistence
-    const ph = computePersistence(distMatrix);
-    const h0sig = ph.h0.filter(f => f.significant).length;
-    const h1sig = ph.h1.filter(f => f.significant).length;
-
-    // Run Mapper
-    const lensValues = currentStudies.map(s => {
-      const v = s[dims[0]];
-      return (typeof v === 'number' && isFinite(v)) ? v : 0;
-    });
-    const mapperGraph = runMapper(distMatrix, lensValues, currentStudies, { nBins: 10, overlap: 0.5 });
-    const components = getConnectedComponents(mapperGraph);
-
-    statusEl.textContent = 'TDA complete (' + currentStudies.length + ' studies, ' +
-      dims.length + ' dims, ' + metric + '). H0: ' + ph.h0.length + ' features (' + h0sig + ' sig), H1: ' +
-      ph.h1.length + ' loops (' + h1sig + ' sig). Mapper: ' + mapperGraph.nodes.length + ' nodes, ' +
-      components.length + ' components.';
-    statusEl.style.color = 'var(--green)';
+    executeTDA();
   });
 
   // Load default dataset
   loadDataset('bcg');
+}
+
+// ===== FULL TDA PIPELINE =====
+function executeTDA() {
+  const dims = getSelectedDimensions();
+  const statusEl = document.getElementById('tdaStatus');
+  if (dims.length < 1) {
+    statusEl.textContent = 'Select at least 1 dimension.';
+    statusEl.style.color = 'var(--red)';
+    return;
+  }
+  if (currentStudies.length < 3) {
+    statusEl.textContent = 'Need at least 3 studies.';
+    statusEl.style.color = 'var(--red)';
+    return;
+  }
+
+  const metric = document.querySelector('input[name="distMetric"]:checked').value;
+  const zscores = standardize(currentStudies, dims);
+  const distMatrix = metric === 'mahalanobis'
+    ? mahalanobisDistanceMatrix(zscores)
+    : euclideanDistanceMatrix(zscores);
+
+  // Persistence
+  const ph = computePersistence(distMatrix);
+
+  // PCA for lens
+  const pca = computePCA(zscores, 2);
+
+  // Lens values
+  const lensSelect = document.getElementById('lensSelect');
+  const lensKey = lensSelect.value;
+  let lensValues;
+  if (lensKey === 'pc1') {
+    lensValues = pca.projected.map(p => p[0]);
+  } else {
+    lensValues = currentStudies.map(s => {
+      const v = s[lensKey];
+      return (typeof v === 'number' && isFinite(v)) ? v : 0;
+    });
+  }
+
+  // Mapper params from sliders
+  const nBins = parseInt(document.getElementById('binsSlider').value, 10);
+  const overlapPct = parseInt(document.getElementById('overlapSlider').value, 10);
+  const overlap = overlapPct / 100;
+
+  const mapperGraph = runMapper(distMatrix, lensValues, currentStudies, { nBins, overlap });
+  const components = getConnectedComponents(mapperGraph);
+
+  // Get unique study indices per component (clusters)
+  const clusters = components.map(comp => {
+    const studySet = new Set();
+    for (const node of comp) {
+      for (const idx of node.studies) studySet.add(idx);
+    }
+    return Array.from(studySet).sort((a, b) => a - b);
+  });
+
+  // Assign cluster label to each study
+  const clusterAssignment = new Array(currentStudies.length).fill(-1);
+  clusters.forEach((cl, ci) => {
+    for (const idx of cl) {
+      clusterAssignment[idx] = ci;
+    }
+  });
+
+  // Meta-analysis per cluster
+  const clusterPooled = clusters.map(cl => {
+    const yi = cl.map(i => currentStudies[i].yi ?? 0);
+    const vi = cl.map(i => {
+      const sei = currentStudies[i].sei ?? 0;
+      return sei * sei;
+    });
+    return dlPooled(yi, vi);
+  });
+
+  // Between-cluster Q-test
+  const groups = clusters.map(cl => ({
+    yi: cl.map(i => currentStudies[i].yi ?? 0),
+    vi: cl.map(i => { const sei = currentStudies[i].sei ?? 0; return sei * sei; })
+  }));
+  const betweenQ = clusters.length > 1 ? betweenGroupQ(groups) : null;
+
+  // Store global results
+  tdaResults = {
+    studies: currentStudies,
+    dimensions: dims,
+    metric,
+    distMatrix,
+    zscores,
+    pca,
+    persistence: ph,
+    mapperGraph,
+    components,
+    clusters,
+    clusterAssignment,
+    clusterPooled,
+    betweenQ,
+    lensKey,
+    lensValues,
+    nBins,
+    overlap
+  };
+
+  // Enable export buttons
+  document.getElementById('exportCsvBtn').disabled = false;
+  document.getElementById('exportJsonBtn').disabled = false;
+  document.getElementById('exportRBtn').disabled = false;
+  document.getElementById('exportPngBtn').disabled = false;
+  document.getElementById('togglePersistView').disabled = false;
+
+  // Update status
+  const h0sig = ph.h0.filter(f => f.significant).length;
+  const h1sig = ph.h1.filter(f => f.significant).length;
+  statusEl.textContent = 'TDA complete (' + currentStudies.length + ' studies, ' +
+    dims.length + ' dims, ' + metric + '). H0: ' + ph.h0.length + ' (' + h0sig + ' sig), H1: ' +
+    ph.h1.length + ' (' + h1sig + ' sig). Mapper: ' + mapperGraph.nodes.length + ' nodes, ' +
+    clusters.length + ' subgroups.';
+  statusEl.style.color = 'var(--green)';
+
+  // Switch to Mapper tab FIRST so canvases are visible for rendering
+  const mapperBtn = document.querySelector('.tab-btn[data-tab="tab-mapper"]');
+  if (mapperBtn) mapperBtn.click();
+
+  // Render all visualizations AFTER tab switch so canvases have dimensions
+  setTimeout(() => {
+    renderAllVisualizations();
+    showToast('TDA complete: ' + clusters.length + ' subgroups found', 3000);
+  }, 50);
+}
+
+function renderAllVisualizations() {
+  if (!tdaResults) return;
+  const r = tdaResults;
+
+  // Hide placeholders
+  const ids = ['mapperPlaceholder', 'persistPlaceholder', 'subgroupPlaceholder', 'exportPlaceholder'];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
+
+  // 1. Mapper graph
+  const mapperCanvas = document.getElementById('mapperCanvas');
+  const mapperResult = renderMapperGraph(mapperCanvas, r.mapperGraph, r.studies);
+  tdaResults._mapperPositions = mapperResult.positions;
+
+  // 2. Persistence
+  const persistCanvas = document.getElementById('persistenceCanvas');
+  if (persistViewMode === 'barcode') {
+    renderBarcode(persistCanvas, r.persistence);
+  } else {
+    renderPersistenceDiagram(persistCanvas, r.persistence);
+  }
+
+  // Persistence summary
+  const pSummary = document.getElementById('persistSummary');
+  const h0f = r.persistence.h0.filter(f => isFinite(f.death));
+  const h0sig = r.persistence.h0.filter(f => f.significant && isFinite(f.death));
+  const h1sig = r.persistence.h1.filter(f => f.significant);
+  pSummary.innerHTML = '<div class="status-bar status-info">' +
+    '<strong>H0:</strong> ' + r.persistence.h0.length + ' features (' + h0sig.length + ' significant) | ' +
+    '<strong>H1:</strong> ' + r.persistence.h1.length + ' loops (' + h1sig.length + ' significant)' +
+    '</div>';
+
+  // 3. Subgroups
+  renderSubgroups();
+
+  // 4. Export R code preview
+  generateRCodePreview();
+}
+
+// ===== SUBGROUP RENDERING =====
+function renderSubgroups() {
+  if (!tdaResults) return;
+  const r = tdaResults;
+
+  // Summary text
+  const summaryEl = document.getElementById('subgroupSummary');
+  let summaryHtml = '<div class="status-bar status-info mb-16">';
+  summaryHtml += '<strong>TDA identified ' + r.clusters.length + ' topologically distinct subgroup' + (r.clusters.length !== 1 ? 's' : '') + '.</strong><br>';
+  if (r.betweenQ && r.clusters.length > 1) {
+    summaryHtml += 'Between-cluster heterogeneity: Q = ' + r.betweenQ.Q.toFixed(2) +
+      ', df = ' + r.betweenQ.df + ', p = ' + r.betweenQ.p.toFixed(4) + '.<br>';
+    if (r.betweenQ.p < 0.05) {
+      summaryHtml += '<span style="color:var(--red);font-weight:600;">Significant between-cluster heterogeneity detected.</span><br>';
+    }
+  }
+  summaryHtml += '<em>Note: TDA subgroup discovery is exploratory (hypothesis-generating). Clusters are data-driven and should be validated in independent datasets before informing clinical decisions.</em>';
+  summaryHtml += '</div>';
+  summaryEl.innerHTML = summaryHtml;
+
+  // Summary table
+  const tableEl = document.getElementById('subgroupTable');
+  let tHtml = '<table><thead><tr><th>Cluster</th><th>k</th><th>Pooled Effect</th><th>95% CI</th><th>I\u00B2</th><th>\u03C4\u00B2</th></tr></thead><tbody>';
+  r.clusters.forEach((cl, ci) => {
+    const p = r.clusterPooled[ci];
+    if (!p) return;
+    tHtml += '<tr><td>Cluster ' + (ci + 1) + '</td>';
+    tHtml += '<td>' + p.k + '</td>';
+    tHtml += '<td>' + p.theta.toFixed(4) + '</td>';
+    tHtml += '<td>[' + p.ci[0].toFixed(4) + ', ' + p.ci[1].toFixed(4) + ']</td>';
+    tHtml += '<td>' + p.I2.toFixed(1) + '%</td>';
+    tHtml += '<td>' + p.tau2.toFixed(4) + '</td></tr>';
+  });
+  tHtml += '</tbody></table>';
+  tableEl.innerHTML = tHtml;
+
+  // Covariate profile table
+  const covEl = document.getElementById('subgroupCovariates');
+  if (r.clusters.length > 1 && r.dimensions.length > 0) {
+    let cHtml = '<h3 style="color:var(--accent);margin-bottom:12px;">Covariate Profiles</h3>';
+    cHtml += '<table><thead><tr><th>Dimension</th>';
+    r.clusters.forEach((_, ci) => {
+      cHtml += '<th>Cluster ' + (ci + 1) + '</th>';
+    });
+    cHtml += '</tr></thead><tbody>';
+
+    // Compute overall means and SDs per dimension
+    const overallStats = {};
+    for (const dim of r.dimensions) {
+      const vals = r.studies.map(s => {
+        const v = s[dim];
+        return (typeof v === 'number' && isFinite(v)) ? v : 0;
+      });
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const sd = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / vals.length);
+      overallStats[dim] = { mean, sd };
+    }
+
+    // Compute cluster means per dimension
+    for (const dim of r.dimensions) {
+      cHtml += '<tr><td>' + escapeHtml(dim) + '</td>';
+      r.clusters.forEach(cl => {
+        const vals = cl.map(i => {
+          const v = r.studies[i][dim];
+          return (typeof v === 'number' && isFinite(v)) ? v : 0;
+        });
+        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+        const sd = vals.length > 1 ? Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / (vals.length - 1)) : 0;
+        const diff = overallStats[dim].sd > 0 ? Math.abs(mean - overallStats[dim].mean) / overallStats[dim].sd : 0;
+        const highlight = diff > 1 ? ' style="font-weight:600;background:rgba(37,99,235,0.08);"' : '';
+        cHtml += '<td' + highlight + '>' + mean.toFixed(3) + ' \u00B1 ' + sd.toFixed(3) + '</td>';
+      });
+      cHtml += '</tr>';
+    }
+    cHtml += '</tbody></table>';
+    covEl.innerHTML = cHtml;
+  } else {
+    covEl.innerHTML = '';
+  }
+
+  // Forest plots per cluster
+  const forestEl = document.getElementById('subgroupForests');
+  forestEl.innerHTML = '';
+  r.clusters.forEach((cl, ci) => {
+    const p = r.clusterPooled[ci];
+    const clStudies = cl.map(i => r.studies[i]);
+    const container = document.createElement('div');
+    container.className = 'card';
+    container.style.marginBottom = '16px';
+    const canvasContainer = document.createElement('div');
+    canvasContainer.className = 'canvas-container';
+    canvasContainer.style.minHeight = '100px';
+    const canvas = document.createElement('canvas');
+    canvas.id = 'forestCanvas_' + ci;
+    canvasContainer.appendChild(canvas);
+    container.appendChild(canvasContainer);
+    forestEl.appendChild(container);
+
+    // Render after DOM insertion so sizing works
+    setTimeout(() => {
+      renderForestPlot(canvas, clStudies, p, 'Cluster ' + (ci + 1) + ' (k = ' + cl.length + ')');
+    }, 10);
+  });
+}
+
+
+function rerenderForestPlots() {
+  if (!tdaResults) return;
+  const r = tdaResults;
+  r.clusters.forEach((cl, ci) => {
+    const canvas = document.getElementById('forestCanvas_' + ci);
+    if (canvas && canvas.width === 0) {
+      const p = r.clusterPooled[ci];
+      const clStudies = cl.map(i => r.studies[i]);
+      renderForestPlot(canvas, clStudies, p, 'Cluster ' + (ci + 1) + ' (k = ' + cl.length + ')');
+    }
+  });
+}
+
+
+// ===== EXPORT MODULE =====
+
+function generateRCode() {
+  if (!tdaResults) return '';
+  const r = tdaResults;
+  const studyLines = r.studies.map((s, i) => {
+    const name = (s.study ?? ('Study_' + (i + 1))).replace(/'/g, "\\'");
+    return '  c("' + name + '", ' + (s.yi ?? 0) + ', ' + (s.sei ?? 0) + ', ' + (r.clusterAssignment[i] + 1) + ')';
+  });
+
+  let code = '# TDA-MA: R Reproduction Script\n';
+  code += '# Generated ' + new Date().toISOString().split('T')[0] + '\n\n';
+  code += 'library(TDAstats)\nlibrary(metafor)\n\n';
+  code += '# Dataset\n';
+  code += 'dat_raw <- rbind(\n' + studyLines.join(',\n') + '\n)\n';
+  code += 'dat <- data.frame(\n';
+  code += '  study = dat_raw[,1],\n';
+  code += '  yi = as.numeric(dat_raw[,2]),\n';
+  code += '  sei = as.numeric(dat_raw[,3]),\n';
+  code += '  cluster = as.integer(dat_raw[,4]),\n';
+  code += '  stringsAsFactors = FALSE\n)\n\n';
+
+  // Covariates
+  const numCols = r.dimensions.filter(d => d !== 'yi' && d !== 'sei');
+  if (numCols.length > 0) {
+    for (const col of numCols) {
+      const vals = r.studies.map(s => {
+        const v = s[col];
+        return (typeof v === 'number' && isFinite(v)) ? v : 'NA';
+      });
+      code += 'dat$' + col + ' <- c(' + vals.join(', ') + ')\n';
+    }
+    code += '\n';
+  }
+
+  code += '# Persistent homology\n';
+  code += 'X <- scale(dat[, c(' + r.dimensions.map(d => '"' + d + '"').join(', ') + ')])\n';
+  code += 'ph <- calculate_homology(X, dim = 1)\n';
+  code += 'plot_persist(ph)\n\n';
+
+  code += '# Overall DL pooling\n';
+  code += 'overall <- rma(yi, sei^2, data = dat, method = "DL")\n';
+  code += 'print(overall)\n\n';
+
+  code += '# Per-cluster pooling\n';
+  code += 'for (cl in sort(unique(dat$cluster))) {\n';
+  code += '  sub <- dat[dat$cluster == cl, ]\n';
+  code += '  cat("\\n=== Cluster", cl, "(k =", nrow(sub), ") ===\\n")\n';
+  code += '  if (nrow(sub) >= 2) {\n';
+  code += '    fit <- rma(yi, sei^2, data = sub, method = "DL")\n';
+  code += '    print(fit)\n';
+  code += '  } else {\n';
+  code += '    cat("Single study: yi =", sub$yi, "sei =", sub$sei, "\\n")\n';
+  code += '  }\n';
+  code += '}\n\n';
+
+  if (r.clusters.length > 1) {
+    code += '# Between-cluster heterogeneity (Q-test on cluster moderator)\n';
+    code += 'mod <- rma(yi, sei^2, mods = ~ factor(cluster), data = dat, method = "DL")\n';
+    code += 'print(mod)\n';
+  }
+
+  return code;
+}
+
+function generateRCodePreview() {
+  const code = generateRCode();
+  const codeEl = document.getElementById('rCodePreview');
+  const containerEl = document.getElementById('exportRCode');
+  if (code) {
+    codeEl.value = code;
+    containerEl.style.display = 'block';
+  } else {
+    containerEl.style.display = 'none';
+  }
+}
+
+function exportCSV() {
+  if (!tdaResults) return;
+  const r = tdaResults;
+  const cols = Object.keys(r.studies[0]);
+  let csv = [...cols, 'tda_cluster'].join(',') + '\n';
+  r.studies.forEach((s, i) => {
+    const vals = cols.map(c => {
+      const v = s[c];
+      if (typeof v === 'string' && v.includes(',')) return '"' + v.replace(/"/g, '""') + '"';
+      return v ?? '';
+    });
+    vals.push(r.clusterAssignment[i] + 1);
+    csv += vals.join(',') + '\n';
+  });
+  downloadBlob(csv, 'tda_ma_results.csv', 'text/csv');
+}
+
+function exportJSON() {
+  if (!tdaResults) return;
+  const r = tdaResults;
+  const exportObj = {
+    meta: {
+      generated: new Date().toISOString(),
+      tool: 'TDA-MA v1.0',
+      k: r.studies.length,
+      dimensions: r.dimensions,
+      metric: r.metric,
+      nBins: r.nBins,
+      overlap: r.overlap,
+      lens: r.lensKey
+    },
+    persistence: {
+      h0: r.persistence.h0,
+      h1: r.persistence.h1
+    },
+    mapper: {
+      nodes: r.mapperGraph.nodes.map(n => ({ id: n.id, studies: n.studies, meanEffect: n.meanEffect })),
+      edges: r.mapperGraph.edges
+    },
+    clusters: r.clusters.map((cl, ci) => ({
+      id: ci + 1,
+      studyIndices: cl,
+      pooled: r.clusterPooled[ci]
+    })),
+    betweenGroupQ: r.betweenQ,
+    studies: r.studies.map((s, i) => ({ ...s, tda_cluster: r.clusterAssignment[i] + 1 }))
+  };
+  const json = JSON.stringify(exportObj, null, 2);
+  downloadBlob(json, 'tda_ma_results.json', 'application/json');
+}
+
+function exportRScript() {
+  const code = generateRCode();
+  if (!code) return;
+  downloadBlob(code, 'tda_ma_analysis.R', 'text/plain');
+}
+
+function exportMapperPNG() {
+  const canvas = document.getElementById('mapperCanvas');
+  if (!canvas) return;
+  canvas.toBlob(function(blob) {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'tda_mapper_graph.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 'image/png');
+}
+
+function downloadBlob(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+
+// ===== MAPPER CONTROLS WIRING =====
+function initMapperControls() {
+  const binsSlider = document.getElementById('binsSlider');
+  const binsLabel = document.getElementById('binsLabel');
+  const overlapSlider = document.getElementById('overlapSlider');
+  const overlapLabel = document.getElementById('overlapLabel');
+
+  binsSlider.addEventListener('input', () => {
+    binsLabel.textContent = binsSlider.value;
+  });
+  overlapSlider.addEventListener('input', () => {
+    overlapLabel.textContent = overlapSlider.value + '%';
+  });
+
+  // Debounced re-run on control change
+  const rerunDebounced = debounce(() => {
+    if (tdaResults) executeTDA();
+  }, 150);
+
+  binsSlider.addEventListener('change', rerunDebounced);
+  overlapSlider.addEventListener('change', rerunDebounced);
+  document.getElementById('lensSelect').addEventListener('change', rerunDebounced);
+
+  // Update lens dropdown when dataset changes
+  const origLoad = loadDataset;
+  // We'll populate lens options after data load
+}
+
+function updateLensOptions() {
+  const select = document.getElementById('lensSelect');
+  const existing = new Set();
+  for (const opt of select.options) existing.add(opt.value);
+
+  // Add numeric columns from current studies
+  const numCols = getNumericColumns(currentStudies);
+  // Remove all except pc1
+  while (select.options.length > 1) select.remove(1);
+  existing.clear();
+  existing.add('pc1');
+
+  for (const col of numCols) {
+    if (!existing.has(col)) {
+      const opt = document.createElement('option');
+      opt.value = col;
+      opt.textContent = col;
+      select.appendChild(opt);
+    }
+  }
+}
+
+
+// ===== MAPPER TOOLTIP & CLICK =====
+function initMapperInteractions() {
+  const canvas = document.getElementById('mapperCanvas');
+  const tooltip = document.getElementById('mapperTooltip');
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (!tdaResults || !tdaResults._mapperPositions) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    const positions = tdaResults._mapperPositions;
+    const graph = tdaResults.mapperGraph;
+    let nearest = -1;
+    let nearestDist = 20;
+
+    for (let i = 0; i < positions.length; i++) {
+      const dx = mx - positions[i].x;
+      const dy = my - positions[i].y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const radius = Math.max(8, Math.min(40, Math.sqrt(graph.nodes[i].studies.length) * 10));
+      if (d < radius + 5 && d < nearestDist) {
+        nearest = i;
+        nearestDist = d;
+      }
+    }
+
+    if (nearest >= 0) {
+      const node = graph.nodes[nearest];
+      const studyNames = node.studies.slice(0, 5).map(idx => {
+        const s = tdaResults.studies[idx];
+        return escapeHtml((s.study ?? ('Study ' + (idx + 1))).substring(0, 25));
+      });
+      let html = '<strong>Node ' + node.id + '</strong> (' + node.studies.length + ' studies)<br>';
+      html += 'Mean effect: ' + node.meanEffect.toFixed(4) + '<br>';
+      html += studyNames.join('<br>');
+      if (node.studies.length > 5) html += '<br>... +' + (node.studies.length - 5) + ' more';
+
+      tooltip.innerHTML = html;
+      tooltip.style.display = 'block';
+      tooltip.style.left = Math.min(mx + 10, canvas.clientWidth - 200) + 'px';
+      tooltip.style.top = (my + 10) + 'px';
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    tooltip.style.display = 'none';
+  });
+
+  canvas.addEventListener('click', (e) => {
+    if (!tdaResults || !tdaResults._mapperPositions) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const positions = tdaResults._mapperPositions;
+    const graph = tdaResults.mapperGraph;
+
+    for (let i = 0; i < positions.length; i++) {
+      const dx = mx - positions[i].x;
+      const dy = my - positions[i].y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const radius = Math.max(8, Math.min(40, Math.sqrt(graph.nodes[i].studies.length) * 10));
+      if (d < radius + 5) {
+        // Find which cluster this node belongs to
+        const nodeStudies = new Set(graph.nodes[i].studies);
+        let targetCluster = -1;
+        for (let ci = 0; ci < tdaResults.clusters.length; ci++) {
+          if (tdaResults.clusters[ci].some(idx => nodeStudies.has(idx))) {
+            targetCluster = ci;
+            break;
+          }
+        }
+        // Switch to subgroups tab
+        const subBtn = document.querySelector('.tab-btn[data-tab="tab-subgroups"]');
+        if (subBtn) subBtn.click();
+        // Scroll to the relevant forest plot
+        if (targetCluster >= 0) {
+          const forestCanvas = document.getElementById('forestCanvas_' + targetCluster);
+          if (forestCanvas) {
+            setTimeout(() => forestCanvas.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
+          }
+        }
+        break;
+      }
+    }
+  });
+}
+
+// ===== PERSISTENCE VIEW TOGGLE =====
+function initPersistenceToggle() {
+  const btn = document.getElementById('togglePersistView');
+  btn.addEventListener('click', () => {
+    if (persistViewMode === 'barcode') {
+      persistViewMode = 'diagram';
+      btn.textContent = 'Show Barcode';
+    } else {
+      persistViewMode = 'barcode';
+      btn.textContent = 'Show Persistence Diagram';
+    }
+    if (tdaResults) {
+      const canvas = document.getElementById('persistenceCanvas');
+      if (persistViewMode === 'barcode') {
+        renderBarcode(canvas, tdaResults.persistence);
+      } else {
+        renderPersistenceDiagram(canvas, tdaResults.persistence);
+      }
+    }
+  });
+}
+
+// ===== EXPORT BUTTON WIRING =====
+function initExportButtons() {
+  document.getElementById('exportCsvBtn').addEventListener('click', exportCSV);
+  document.getElementById('exportJsonBtn').addEventListener('click', exportJSON);
+  document.getElementById('exportRBtn').addEventListener('click', exportRScript);
+  document.getElementById('exportPngBtn').addEventListener('click', exportMapperPNG);
 }
 
 
@@ -2047,12 +3308,249 @@ function testMapper() {
   return results;
 }
 
+function testMetaAnalysis() {
+  const results = [];
+
+  // Test 1: normalCDF(0) = 0.5
+  results.push({
+    name: 'normalCDF(0) = 0.5',
+    pass: Math.abs(normalCDF(0) - 0.5) < 1e-6,
+    detail: 'Got ' + normalCDF(0).toFixed(8)
+  });
+
+  // Test 2: normalCDF(1.96) ~ 0.975
+  results.push({
+    name: 'normalCDF(1.96) ~ 0.975',
+    pass: Math.abs(normalCDF(1.96) - 0.975) < 0.001,
+    detail: 'Got ' + normalCDF(1.96).toFixed(6)
+  });
+
+  // Test 3: chi2CDF basic
+  results.push({
+    name: 'chi2CDF(3.841, 1) ~ 0.95',
+    pass: Math.abs(chi2CDF(3.841, 1) - 0.95) < 0.02,
+    detail: 'Got ' + chi2CDF(3.841, 1).toFixed(4)
+  });
+
+  // Test 4-6: BCG DL pooling matches metafor
+  const bcg = DATASETS.bcg.studies;
+  const yi = bcg.map(s => s.yi);
+  const vi = bcg.map(s => s.sei ** 2);
+  const dl = dlPooled(yi, vi);
+
+  // Reference: DL on these specific yi/sei values (verified manually)
+  results.push({
+    name: 'DL theta ~ -0.695 (BCG)',
+    pass: dl != null && Math.abs(dl.theta - (-0.6951)) < 0.01,
+    detail: dl ? 'Got ' + dl.theta.toFixed(4) : 'null'
+  });
+
+  results.push({
+    name: 'DL tau2 ~ 0.328 (BCG)',
+    pass: dl != null && Math.abs(dl.tau2 - 0.3276) < 0.01,
+    detail: dl ? 'Got ' + dl.tau2.toFixed(4) : 'null'
+  });
+
+  results.push({
+    name: 'DL I2 ~ 77% (BCG)',
+    pass: dl != null && Math.abs(dl.I2 - 76.79) < 1,
+    detail: dl ? 'Got ' + dl.I2.toFixed(2) + '%' : 'null'
+  });
+
+  // Test 7: DL Q ~ 51.70
+  results.push({
+    name: 'DL Q ~ 51.70 (BCG)',
+    pass: dl != null && Math.abs(dl.Q - 51.70) < 1,
+    detail: dl ? 'Got ' + dl.Q.toFixed(2) : 'null'
+  });
+
+  // Test 8: DL k = 13
+  results.push({
+    name: 'DL k = 13 (BCG)',
+    pass: dl != null && dl.k === 13,
+    detail: dl ? 'Got ' + dl.k : 'null'
+  });
+
+  // Test 9: Single study pooling
+  const single = dlPooled([0.5], [0.04]);
+  results.push({
+    name: 'DL single study: theta=0.5, tau2=0',
+    pass: single != null && single.theta === 0.5 && single.tau2 === 0,
+    detail: single ? 'theta=' + single.theta + ', tau2=' + single.tau2 : 'null'
+  });
+
+  // Test 10: Empty pooling returns null
+  results.push({
+    name: 'DL empty: returns null',
+    pass: dlPooled([], []) === null,
+    detail: String(dlPooled([], []))
+  });
+
+  // Test 11: Between-group Q for BCG latitude
+  const highLat = bcg.filter(s => s.latitude >= 33);
+  const lowLat = bcg.filter(s => s.latitude < 33);
+  const qt = betweenGroupQ([
+    { yi: highLat.map(s => s.yi), vi: highLat.map(s => s.sei ** 2) },
+    { yi: lowLat.map(s => s.yi), vi: lowLat.map(s => s.sei ** 2) }
+  ]);
+  results.push({
+    name: 'Q-between > 0 (BCG latitude)',
+    pass: qt.Q > 0,
+    detail: 'Q = ' + qt.Q.toFixed(4)
+  });
+
+  results.push({
+    name: 'Q-between p < 0.05 (BCG latitude)',
+    pass: qt.p < 0.05,
+    detail: 'p = ' + qt.p.toFixed(6)
+  });
+
+  // Test 13: DL CI contains theta
+  results.push({
+    name: 'DL CI contains theta',
+    pass: dl != null && dl.ci[0] < dl.theta && dl.theta < dl.ci[1],
+    detail: dl ? dl.ci[0].toFixed(4) + ' < ' + dl.theta.toFixed(4) + ' < ' + dl.ci[1].toFixed(4) : 'null'
+  });
+
+  // Test 14: DL p < 0.05 for BCG
+  results.push({
+    name: 'DL p < 0.05 (BCG)',
+    pass: dl != null && dl.p < 0.05,
+    detail: dl ? 'p = ' + dl.p.toFixed(6) : 'null'
+  });
+
+  return results;
+}
+
+function testVisualization() {
+  const results = [];
+
+  // Test force-directed layout
+  const mockNodes = [{ id: 0 }, { id: 1 }, { id: 2 }];
+  const mockEdges = [{ source: 0, target: 1 }, { source: 1, target: 2 }];
+  const layout = forceDirectedLayout(mockNodes, mockEdges, 500, 400);
+
+  results.push({
+    name: 'Force layout: produces positions for all nodes',
+    pass: layout.length === 3 && layout.every(p => typeof p.x === 'number' && typeof p.y === 'number'),
+    detail: 'Got ' + layout.length + ' positions'
+  });
+
+  results.push({
+    name: 'Force layout: positions within bounds',
+    pass: layout.every(p => p.x >= 0 && p.x <= 500 && p.y >= 0 && p.y <= 400),
+    detail: layout.map(p => '(' + p.x.toFixed(0) + ',' + p.y.toFixed(0) + ')').join(' ')
+  });
+
+  // Test effectColor
+  const blue = effectColor(-1, -1, 1);
+  const white = effectColor(0, -1, 1);
+  const red = effectColor(1, -1, 1);
+  results.push({
+    name: 'effectColor: blue at min, red at max',
+    pass: blue.includes('59') && red.includes('239'),
+    detail: 'min=' + blue + ', max=' + red
+  });
+  results.push({
+    name: 'effectColor: white at midpoint',
+    pass: white === 'rgb(255,255,255)',
+    detail: 'mid=' + white
+  });
+
+  // Test single-node layout
+  const single = forceDirectedLayout([{ id: 0 }], [], 500, 400);
+  results.push({
+    name: 'Force layout: single node at center',
+    pass: single.length === 1 && single[0].x === 250 && single[0].y === 200,
+    detail: '(' + single[0].x + ',' + single[0].y + ')'
+  });
+
+  // Test empty layout
+  const empty = forceDirectedLayout([], [], 500, 400);
+  results.push({
+    name: 'Force layout: empty returns empty',
+    pass: empty.length === 0,
+    detail: 'length=' + empty.length
+  });
+
+  return results;
+}
+
+function testExport() {
+  const results = [];
+
+  // Test R code generation with mock tdaResults
+  const savedResults = tdaResults;
+
+  // Setup minimal mock
+  tdaResults = {
+    studies: DATASETS.bcg.studies.slice(0, 3),
+    dimensions: ['yi', 'sei'],
+    metric: 'euclidean',
+    clusters: [[0, 1], [2]],
+    clusterAssignment: [0, 0, 1],
+    clusterPooled: [
+      dlPooled([DATASETS.bcg.studies[0].yi, DATASETS.bcg.studies[1].yi],
+               [DATASETS.bcg.studies[0].sei ** 2, DATASETS.bcg.studies[1].sei ** 2]),
+      dlPooled([DATASETS.bcg.studies[2].yi], [DATASETS.bcg.studies[2].sei ** 2])
+    ],
+    betweenQ: { Q: 1, df: 1, p: 0.3 },
+    persistence: { h0: [], h1: [] },
+    mapperGraph: { nodes: [], edges: [] },
+    lensKey: 'pc1',
+    nBins: 10,
+    overlap: 0.5
+  };
+
+  const rCode = generateRCode();
+  results.push({
+    name: 'R code: contains library(metafor)',
+    pass: rCode.includes('library(metafor)'),
+    detail: 'length=' + rCode.length
+  });
+  results.push({
+    name: 'R code: contains library(TDAstats)',
+    pass: rCode.includes('library(TDAstats)'),
+    detail: 'Has TDAstats'
+  });
+  results.push({
+    name: 'R code: contains rma() call',
+    pass: rCode.includes('rma(yi'),
+    detail: 'Has rma'
+  });
+  results.push({
+    name: 'R code: contains cluster variable',
+    pass: rCode.includes('cluster'),
+    detail: 'Has cluster'
+  });
+
+  // Restore
+  tdaResults = savedResults;
+
+  // Test debounce
+  let callCount = 0;
+  const debounced = debounce(() => callCount++, 10);
+  debounced();
+  debounced();
+  debounced();
+  results.push({
+    name: 'Debounce: immediate calls do not fire',
+    pass: callCount === 0,
+    detail: 'calls=' + callCount
+  });
+
+  return results;
+}
+
 function runAllTests() {
   const results = [];
   results.push(...testDataModule());
   results.push(...testDistanceMatrix());
   results.push(...testPersistence());
   results.push(...testMapper());
+  results.push(...testMetaAnalysis());
+  results.push(...testVisualization());
+  results.push(...testExport());
 
   const modal = document.getElementById('testModal');
   const container = document.getElementById('testResults');
@@ -2111,6 +3609,10 @@ document.addEventListener('DOMContentLoaded', () => {
   initDarkMode();
   initDataTab();
   initTestModal();
+  initMapperControls();
+  initMapperInteractions();
+  initPersistenceToggle();
+  initExportButtons();
 });
 </script>
 </body>
