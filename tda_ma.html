@@ -968,6 +968,471 @@ function computePCA(points, nComponents) {
 }
 
 
+// ===== PERSISTENT HOMOLOGY ENGINE =====
+
+// --- Union-Find data structure ---
+class UnionFind {
+  constructor(n) {
+    this.parent = Array.from({length: n}, (_, i) => i);
+    this.rank = new Array(n).fill(0);
+  }
+  find(x) {
+    if (this.parent[x] !== x) this.parent[x] = this.find(this.parent[x]);
+    return this.parent[x];
+  }
+  union(x, y) {
+    const rx = this.find(x), ry = this.find(y);
+    if (rx === ry) return false;
+    if (this.rank[rx] < this.rank[ry]) this.parent[rx] = ry;
+    else if (this.rank[rx] > this.rank[ry]) this.parent[ry] = rx;
+    else { this.parent[ry] = rx; this.rank[rx]++; }
+    return true;
+  }
+}
+
+// --- H0: connected components via Rips filtration ---
+function computeH0(distMatrix) {
+  const k = distMatrix.length;
+  if (k === 0) return [];
+
+  // Generate all edges
+  const edges = [];
+  for (let i = 0; i < k; i++) {
+    for (let j = i + 1; j < k; j++) {
+      edges.push({ i, j, dist: distMatrix[i][j] });
+    }
+  }
+  // Sort by distance ascending
+  edges.sort((a, b) => a.dist - b.dist);
+
+  const uf = new UnionFind(k);
+  // Track birth order: each study born at epsilon=0
+  // birthOrder[i] = the earliest index in the component containing i
+  const birthOrder = Array.from({length: k}, (_, i) => i);
+
+  const features = []; // H0 persistence features
+
+  for (const edge of edges) {
+    const ri = uf.find(edge.i);
+    const rj = uf.find(edge.j);
+    if (ri === rj) continue; // Already connected
+
+    // Determine which component is "younger" (higher birth order = born later conceptually)
+    // Use higher min-index as the one that dies
+    const minI = birthOrder[ri];
+    const minJ = birthOrder[rj];
+
+    // The component with the higher representative index dies
+    if (minI < minJ) {
+      // Component containing j dies
+      features.push({ birth: 0, death: edge.dist, persistence: edge.dist });
+    } else {
+      // Component containing i dies
+      features.push({ birth: 0, death: edge.dist, persistence: edge.dist });
+    }
+
+    uf.union(edge.i, edge.j);
+    // Update birth order for merged component
+    const newRoot = uf.find(edge.i);
+    birthOrder[newRoot] = Math.min(minI, minJ);
+  }
+
+  // The last surviving component gets death = Infinity
+  features.push({ birth: 0, death: Infinity, persistence: Infinity });
+
+  return features;
+}
+
+// --- H1: 1-cycles via boundary matrix reduction ---
+function computeH1(distMatrix) {
+  const k = distMatrix.length;
+  if (k < 3) return [];
+
+  // Generate all edges and determine max filtration
+  // maxFiltration = max pairwise distance (diameter), NOT MST max.
+  // H1 cycles can be born/die beyond the MST distance.
+  const edges = [];
+  let maxFiltration = 0;
+  for (let i = 0; i < k; i++) {
+    for (let j = i + 1; j < k; j++) {
+      edges.push({ i, j, dist: distMatrix[i][j] });
+      if (distMatrix[i][j] > maxFiltration) maxFiltration = distMatrix[i][j];
+    }
+  }
+  edges.sort((a, b) => a.dist - b.dist);
+
+  // Build edge index: map (i,j) where i<j to sequential index
+  // Only include edges with dist <= maxFiltration (all of them since maxFiltration is the spanning tree max)
+  const edgeIndex = new Map();
+  const edgeList = []; // {i, j, dist, idx}
+  let edgeIdx = 0;
+  for (const edge of edges) {
+    const key = edge.i + ',' + edge.j;
+    edgeIndex.set(key, edgeIdx);
+    edgeList.push({ i: edge.i, j: edge.j, dist: edge.dist, idx: edgeIdx });
+    edgeIdx++;
+  }
+  const nEdges = edgeList.length;
+
+  // Generate all triangles (i,j,k) where i<j<m
+  // Filtration value = max of the three edge distances
+  const triangles = [];
+  for (let i = 0; i < k; i++) {
+    for (let j = i + 1; j < k; j++) {
+      const dij = distMatrix[i][j];
+      if (dij > maxFiltration) continue;
+      for (let m = j + 1; m < k; m++) {
+        const dim = distMatrix[i][m];
+        const djm = distMatrix[j][m];
+        if (dim > maxFiltration || djm > maxFiltration) continue;
+        const filtVal = Math.max(dij, dim, djm);
+        triangles.push({ v: [i, j, m], filt: filtVal });
+      }
+    }
+  }
+  triangles.sort((a, b) => a.filt - b.filt);
+
+  if (triangles.length === 0) return [];
+
+  // Boundary matrix reduction (Z/2 coefficients)
+  // Each triangle's boundary = 3 edges
+  // We use sparse column representation: each column is a Set of row indices (edge indices)
+  const nTriangles = triangles.length;
+
+  // For each triangle, compute its boundary edges
+  function getEdgeKey(a, b) {
+    return a < b ? a + ',' + b : b + ',' + a;
+  }
+
+  const columns = []; // one per triangle
+  for (const tri of triangles) {
+    const [a, b, c] = tri.v; // a < b < c
+    const e1 = edgeIndex.get(getEdgeKey(b, c)); // edge {b,c}
+    const e2 = edgeIndex.get(getEdgeKey(a, c)); // edge {a,c}
+    const e3 = edgeIndex.get(getEdgeKey(a, b)); // edge {a,b}
+    const col = new Set();
+    if (e1 !== undefined) col.add(e1);
+    if (e2 !== undefined) col.add(e2);
+    if (e3 !== undefined) col.add(e3);
+    columns.push(col);
+  }
+
+  // Column reduction: for each column, reduce using previous columns
+  // low[j] = the lowest (highest index) non-zero row in column j
+  // pivotCol[row] = which column has this row as its pivot
+  const pivotCol = new Map(); // row -> column index
+  const h1Features = [];
+
+  function getLowest(col) {
+    if (col.size === 0) return -1;
+    let mx = -1;
+    for (const r of col) {
+      if (r > mx) mx = r;
+    }
+    return mx;
+  }
+
+  function xorSets(a, b) {
+    // Symmetric difference (XOR for Z/2)
+    const result = new Set(a);
+    for (const elem of b) {
+      if (result.has(elem)) result.delete(elem);
+      else result.add(elem);
+    }
+    return result;
+  }
+
+  for (let j = 0; j < nTriangles; j++) {
+    let col = columns[j];
+    let low = getLowest(col);
+
+    while (low !== -1 && pivotCol.has(low)) {
+      const prevJ = pivotCol.get(low);
+      col = xorSets(col, columns[prevJ]);
+      low = getLowest(col);
+    }
+
+    columns[j] = col; // Store reduced column
+
+    if (low === -1) {
+      // Column reduced to zero: this triangle kills a cycle
+      // The cycle was born when the last edge of this triangle was added
+      // Birth = the filtration value of the edge that completed the cycle
+      // (the edge with the highest filtration among the triangle's boundary edges)
+      const tri = triangles[j];
+      const [a, b, c] = tri.v;
+      const edgeDists = [distMatrix[a][b], distMatrix[a][c], distMatrix[b][c]];
+      edgeDists.sort((x, y) => x - y);
+      const birth = edgeDists[edgeDists.length - 1]; // Last edge to appear
+      // But wait — the cycle is born when 2 edges form a path, and dies when the triangle fills it
+      // Actually: birth = second-largest edge distance (when cycle forms), death = largest (when triangle fills)
+      // No — standard persistence: birth = filtration of the last edge that completes the cycle = edgeDists[2]
+      // death = filtration of the triangle = tri.filt = max(edgeDists) = edgeDists[2]
+      // That gives persistence 0, which is wrong.
+      //
+      // Correct approach: the H1 feature is born when the boundary cycle forms (all 3 edges exist)
+      // and dies when the triangle fills it. But the triangle's filtration = max edge = when the cycle forms.
+      // So a triangle whose edges all appear at the same time creates a cycle with persistence 0.
+      //
+      // For a non-trivial H1 feature: the cycle is born at max(edge dists of cycle edges),
+      // and dies at the triangle's filtration. For a minimal cycle (3 edges), these are the same,
+      // so the real H1 features come from cycles that are NOT boundaries of single triangles.
+      //
+      // In the standard persistence algorithm: the birth of the cycle killed by column j
+      // is the filtration of edge 'low' (the pivot row), and death = filtration of triangle j.
+      // This is correct because 'low' is the edge whose addition created the cycle.
+      // When that edge enters, the other edges in the boundary chain were already present,
+      // forming a path — the new edge closes the cycle.
+      // The triangle then fills/kills the cycle at its own filtration value.
+
+      // Actually we need to track this properly. In the standard algorithm:
+      // - The pivot row 'low' before reduction tells us which edge created the cycle
+      // - But we already reduced the column to zero, so we need the original pivot
+
+      // Let me redo: we need the birth from the edge perspective.
+      // Re-approach: track when a column reduces to zero
+      // Death = triangle filtration, Birth = ?
+      // In standard persistence for H1:
+      // When column j reduces to zero, it means triangle j is a boundary of a 2-chain,
+      // killing an H1 class. The birth of that class was recorded by the unpaired edge
+      // that was the pivot. We need the filtration of that pivot edge.
+
+      // But we already reduced col to zero. Let me reconsider...
+      // Actually, in the standard algorithm, if a column reduces to zero,
+      // that means the 2-simplex is a boundary — it does NOT create or kill a homology class.
+      // H1 features are created by edges (1-simplices) that don't reduce to zero in the
+      // edge boundary matrix, and killed by triangles whose column has a non-zero pivot.
+
+      // I had it backwards. Let me implement correctly:
+      // - When a triangle column does NOT reduce to zero (has pivot), it kills an H1 class.
+      //   The H1 class was born at the filtration of the pivot edge, dies at triangle filtration.
+      // - When a triangle column reduces to zero, the triangle is redundant (boundary).
+
+      // So this branch (low === -1, column reduced to zero) means NO H1 feature killed.
+      // The H1 features come from the else branch below.
+    } else {
+      // Column has a pivot at row 'low'
+      // This triangle kills an H1 cycle. The cycle was born when edge 'low' was added.
+      pivotCol.set(low, j);
+
+      const birthFilt = edgeList[low].dist;
+      const deathFilt = triangles[j].filt;
+
+      // Only record if persistence > 0 (skip trivial features)
+      if (deathFilt - birthFilt > 1e-14) {
+        h1Features.push({
+          birth: birthFilt,
+          death: deathFilt,
+          persistence: deathFilt - birthFilt
+        });
+      }
+    }
+  }
+
+  // Sort by persistence descending
+  h1Features.sort((a, b) => b.persistence - a.persistence);
+
+  return h1Features;
+}
+
+// --- Combined persistence computation ---
+function computePersistence(distMatrix) {
+  const h0 = computeH0(distMatrix);
+  const h1 = computeH1(distMatrix);
+
+  // Mark significant features: persistence > 2 * median persistence (per dimension)
+  function markSignificant(features) {
+    const finite = features.filter(f => isFinite(f.persistence) && f.persistence > 0);
+    if (finite.length === 0) return features;
+    const sorted = finite.map(f => f.persistence).sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 === 1
+      ? sorted[mid]
+      : (sorted[mid - 1] + sorted[mid]) / 2;
+    const threshold = 2 * median;
+    return features.map(f => ({
+      ...f,
+      significant: isFinite(f.persistence) ? f.persistence > threshold : true
+    }));
+  }
+
+  return {
+    h0: markSignificant(h0),
+    h1: markSignificant(h1)
+  };
+}
+
+
+// ===== MAPPER ALGORITHM =====
+
+// --- Single-linkage clustering ---
+function singleLinkageClusters(indices, distMatrix) {
+  const n = indices.length;
+  if (n === 0) return [];
+  if (n === 1) return [indices.slice()];
+
+  // Build sub-edges sorted by distance
+  const subEdges = [];
+  for (let a = 0; a < n; a++) {
+    for (let b = a + 1; b < n; b++) {
+      subEdges.push({
+        a, b,
+        dist: distMatrix[indices[a]][indices[b]]
+      });
+    }
+  }
+  subEdges.sort((a, b) => a.dist - b.dist);
+
+  // Compute nearest-neighbor distances for automatic cutoff
+  const nnDists = new Array(n).fill(Infinity);
+  for (let a = 0; a < n; a++) {
+    for (let b = 0; b < n; b++) {
+      if (a === b) continue;
+      const d = distMatrix[indices[a]][indices[b]];
+      if (d < nnDists[a]) nnDists[a] = d;
+    }
+  }
+  nnDists.sort((a, b) => a - b);
+  const mid = Math.floor(nnDists.length / 2);
+  const medianNN = nnDists.length % 2 === 1
+    ? nnDists[mid]
+    : (nnDists[mid - 1] + nnDists[mid]) / 2;
+  const cutoff = 1.5 * medianNN;
+
+  // Agglomerative single-linkage with cutoff
+  const uf = new UnionFind(n);
+  for (const edge of subEdges) {
+    if (edge.dist > cutoff) break; // Stop merging beyond cutoff
+    uf.union(edge.a, edge.b);
+  }
+
+  // Extract clusters
+  const clusterMap = new Map();
+  for (let i = 0; i < n; i++) {
+    const root = uf.find(i);
+    if (!clusterMap.has(root)) clusterMap.set(root, []);
+    clusterMap.get(root).push(indices[i]);
+  }
+
+  return Array.from(clusterMap.values());
+}
+
+// --- Core Mapper function ---
+function runMapper(distMatrix, lensValues, studies, opts) {
+  const nBins = (opts && opts.nBins) ?? 10;
+  const overlap = (opts && opts.overlap) ?? 0.5;
+  const k = distMatrix.length;
+
+  if (k === 0) return { nodes: [], edges: [] };
+
+  // Compute cover intervals
+  const lensMin = Math.min(...lensValues);
+  const lensMax = Math.max(...lensValues);
+  const lensRange = lensMax - lensMin;
+
+  if (lensRange === 0) {
+    // All lens values identical — single cluster
+    const meanEffect = studies.reduce((s, st) => s + ((st.yi != null ? st.yi : 0)), 0) / k;
+    return {
+      nodes: [{ id: 0, studies: Array.from({length: k}, (_, i) => i), meanEffect }],
+      edges: []
+    };
+  }
+
+  // interval width and step
+  const width = lensRange / (nBins - (nBins - 1) * overlap);
+  const step = width * (1 - overlap);
+
+  const allNodes = [];
+  let nodeId = 0;
+
+  // For each interval, find studies in range, cluster them
+  for (let b = 0; b < nBins; b++) {
+    const lo = lensMin + b * step;
+    const hi = lo + width;
+
+    // Find indices of studies with lens values in [lo, hi]
+    const inBin = [];
+    for (let i = 0; i < k; i++) {
+      if (lensValues[i] >= lo - 1e-12 && lensValues[i] <= hi + 1e-12) {
+        inBin.push(i);
+      }
+    }
+
+    if (inBin.length === 0) continue;
+
+    // Cluster within this bin
+    const clusters = singleLinkageClusters(inBin, distMatrix);
+
+    for (const cluster of clusters) {
+      let sumEffect = 0;
+      for (const idx of cluster) {
+        sumEffect += (studies[idx].yi != null ? studies[idx].yi : 0);
+      }
+      allNodes.push({
+        id: nodeId++,
+        studies: cluster,
+        meanEffect: sumEffect / cluster.length
+      });
+    }
+  }
+
+  // Build nerve: edges between nodes sharing >= 1 study
+  const allEdges = [];
+  for (let a = 0; a < allNodes.length; a++) {
+    const setA = new Set(allNodes[a].studies);
+    for (let b = a + 1; b < allNodes.length; b++) {
+      let shared = 0;
+      for (const idx of allNodes[b].studies) {
+        if (setA.has(idx)) shared++;
+      }
+      if (shared > 0) {
+        allEdges.push({ source: a, target: b, sharedCount: shared });
+      }
+    }
+  }
+
+  return { nodes: allNodes, edges: allEdges };
+}
+
+// --- Connected components extraction ---
+function getConnectedComponents(graph) {
+  const n = graph.nodes.length;
+  if (n === 0) return [];
+
+  // Build adjacency list
+  const adj = Array.from({length: n}, () => []);
+  for (const edge of graph.edges) {
+    adj[edge.source].push(edge.target);
+    adj[edge.target].push(edge.source);
+  }
+
+  const visited = new Array(n).fill(false);
+  const components = [];
+
+  for (let i = 0; i < n; i++) {
+    if (visited[i]) continue;
+    // BFS
+    const comp = [];
+    const queue = [i];
+    visited[i] = true;
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      comp.push(graph.nodes[cur]);
+      for (const nb of adj[cur]) {
+        if (!visited[nb]) {
+          visited[nb] = true;
+          queue.push(nb);
+        }
+      }
+    }
+    components.push(comp);
+  }
+
+  return components;
+}
+
+
 // ===== DATA MODULE STATE =====
 let currentStudies = [];
 let currentDatasetKey = 'bcg';
@@ -1166,8 +1631,23 @@ function initDataTab() {
       ? mahalanobisDistanceMatrix(zscores)
       : euclideanDistanceMatrix(zscores);
 
-    statusEl.textContent = 'Distance matrix computed (' + currentStudies.length + ' x ' + currentStudies.length + ', ' +
-      dims.length + ' dims, ' + metric + '). Mapper pipeline: coming in Task 4+.';
+    // Run persistence
+    const ph = computePersistence(distMatrix);
+    const h0sig = ph.h0.filter(f => f.significant).length;
+    const h1sig = ph.h1.filter(f => f.significant).length;
+
+    // Run Mapper
+    const lensValues = currentStudies.map(s => {
+      const v = s[dims[0]];
+      return (typeof v === 'number' && isFinite(v)) ? v : 0;
+    });
+    const mapperGraph = runMapper(distMatrix, lensValues, currentStudies, { nBins: 10, overlap: 0.5 });
+    const components = getConnectedComponents(mapperGraph);
+
+    statusEl.textContent = 'TDA complete (' + currentStudies.length + ' studies, ' +
+      dims.length + ' dims, ' + metric + '). H0: ' + ph.h0.length + ' features (' + h0sig + ' sig), H1: ' +
+      ph.h1.length + ' loops (' + h1sig + ' sig). Mapper: ' + mapperGraph.nodes.length + ' nodes, ' +
+      components.length + ' components.';
     statusEl.style.color = 'var(--green)';
   });
 
@@ -1392,10 +1872,187 @@ function testDistanceMatrix() {
   return results;
 }
 
+function testPersistence() {
+  const results = [];
+  // Square: 4 points at (0,0),(1,0),(1,1),(0,1)
+  // Distances: sides=1, diagonals=sqrt(2)~1.4142
+  const D = [
+    [0, 1, Math.SQRT2, 1],
+    [1, 0, 1, Math.SQRT2],
+    [Math.SQRT2, 1, 0, 1],
+    [1, Math.SQRT2, 1, 0]
+  ];
+  const ph = computePersistence(D);
+
+  const h0finite = ph.h0.filter(f => isFinite(f.death));
+  results.push({
+    name: 'H0: 3 finite features',
+    pass: h0finite.length === 3,
+    detail: 'Got ' + h0finite.length
+  });
+  results.push({
+    name: 'H0: all die at eps=1',
+    pass: h0finite.every(f => Math.abs(f.death - 1) < 1e-10),
+    detail: 'Deaths: [' + h0finite.map(f => f.death.toFixed(6)).join(', ') + ']'
+  });
+  results.push({
+    name: 'H0: birth <= death',
+    pass: ph.h0.every(f => f.birth <= f.death),
+    detail: 'All features satisfy birth <= death'
+  });
+  results.push({
+    name: 'H1: at least 1 loop',
+    pass: ph.h1.length >= 1,
+    detail: 'Got ' + ph.h1.length + ' H1 features'
+  });
+  if (ph.h1.length > 0) {
+    results.push({
+      name: 'H1: loop born at ~1, dies at ~1.414',
+      pass: Math.abs(ph.h1[0].birth - 1) < 0.01 && Math.abs(ph.h1[0].death - Math.SQRT2) < 0.01,
+      detail: 'birth=' + ph.h1[0].birth.toFixed(4) + ', death=' + ph.h1[0].death.toFixed(4)
+    });
+  } else {
+    results.push({
+      name: 'H1: loop born at ~1, dies at ~1.414',
+      pass: false,
+      detail: 'No H1 features found'
+    });
+  }
+
+  // Additional: H0 total count = k
+  results.push({
+    name: 'H0: total features = k (4)',
+    pass: ph.h0.length === 4,
+    detail: 'Got ' + ph.h0.length
+  });
+
+  // H0 has exactly 1 infinite feature
+  const h0inf = ph.h0.filter(f => !isFinite(f.death));
+  results.push({
+    name: 'H0: exactly 1 infinite feature',
+    pass: h0inf.length === 1,
+    detail: 'Got ' + h0inf.length
+  });
+
+  // Test BCG persistence
+  const bcgPts = standardize(DATASETS.bcg.studies, ['yi', 'sei']);
+  const bcgD = euclideanDistanceMatrix(bcgPts);
+  const bcgPH = computePersistence(bcgD);
+  results.push({
+    name: 'H0 BCG: 13 features (12 finite + 1 infinite)',
+    pass: bcgPH.h0.length === 13,
+    detail: 'Got ' + bcgPH.h0.length
+  });
+
+  // Test empty distance matrix
+  const emptyPH = computePersistence([]);
+  results.push({
+    name: 'H0 empty: 0 features',
+    pass: emptyPH.h0.length === 0 && emptyPH.h1.length === 0,
+    detail: 'h0=' + emptyPH.h0.length + ', h1=' + emptyPH.h1.length
+  });
+
+  // Test significance marking
+  const hasSignificant = ph.h0.every(f => typeof f.significant === 'boolean');
+  results.push({
+    name: 'Persistence: significance marked',
+    pass: hasSignificant,
+    detail: 'All features have boolean significant field'
+  });
+
+  return results;
+}
+
+function testMapper() {
+  const results = [];
+  const sim = DATASETS.simulated;
+  const dims = ['yi', 'sei'];
+  const points = standardize(sim.studies, dims);
+  const D = euclideanDistanceMatrix(points);
+  const lens = sim.studies.map(s => s.yi);
+
+  const graph = runMapper(D, lens, sim.studies, { nBins: 10, overlap: 0.5 });
+
+  results.push({
+    name: 'Mapper: produces nodes',
+    pass: graph.nodes.length > 0,
+    detail: 'Got ' + graph.nodes.length + ' nodes'
+  });
+  results.push({
+    name: 'Mapper: nodes have studies',
+    pass: graph.nodes[0].studies.length > 0,
+    detail: 'First node has ' + graph.nodes[0].studies.length + ' studies'
+  });
+
+  // All studies should appear in at least one node
+  const allStudies = new Set(graph.nodes.flatMap(n => n.studies));
+  results.push({
+    name: 'Mapper: all studies assigned',
+    pass: allStudies.size === sim.studies.length,
+    detail: 'Assigned ' + allStudies.size + ' / ' + sim.studies.length
+  });
+
+  // Should find >= 2 components for simulated data
+  const components = getConnectedComponents(graph);
+  results.push({
+    name: 'Mapper: >=2 components for simulated',
+    pass: components.length >= 2,
+    detail: 'Got ' + components.length + ' components'
+  });
+
+  // BCG should also work
+  const bcg = DATASETS.bcg;
+  const bcgPts = standardize(bcg.studies, ['yi', 'sei']);
+  const bcgD = euclideanDistanceMatrix(bcgPts);
+  const bcgLens = bcg.studies.map(s => s.yi);
+  const bcgGraph = runMapper(bcgD, bcgLens, bcg.studies, { nBins: 8, overlap: 0.5 });
+  results.push({
+    name: 'Mapper: BCG produces graph',
+    pass: bcgGraph.nodes.length > 0,
+    detail: 'BCG: ' + bcgGraph.nodes.length + ' nodes, ' + bcgGraph.edges.length + ' edges'
+  });
+
+  // Mapper nodes have meanEffect
+  const hasMeanEffect = graph.nodes.every(n => typeof n.meanEffect === 'number' && isFinite(n.meanEffect));
+  results.push({
+    name: 'Mapper: nodes have meanEffect',
+    pass: hasMeanEffect,
+    detail: 'All nodes have finite meanEffect'
+  });
+
+  // Single-linkage clustering direct test
+  const slResult = singleLinkageClusters([0, 1, 2], D);
+  results.push({
+    name: 'SingleLinkage: returns clusters',
+    pass: slResult.length >= 1,
+    detail: 'Got ' + slResult.length + ' clusters'
+  });
+
+  // Edge case: single study
+  const singleClusters = singleLinkageClusters([0], D);
+  results.push({
+    name: 'SingleLinkage: single study = 1 cluster',
+    pass: singleClusters.length === 1 && singleClusters[0].length === 1,
+    detail: 'Got ' + singleClusters.length + ' clusters'
+  });
+
+  // Connected components: empty graph
+  const emptyComp = getConnectedComponents({ nodes: [], edges: [] });
+  results.push({
+    name: 'ConnectedComponents: empty graph = 0',
+    pass: emptyComp.length === 0,
+    detail: 'Got ' + emptyComp.length
+  });
+
+  return results;
+}
+
 function runAllTests() {
   const results = [];
   results.push(...testDataModule());
   results.push(...testDistanceMatrix());
+  results.push(...testPersistence());
+  results.push(...testMapper());
 
   const modal = document.getElementById('testModal');
   const container = document.getElementById('testResults');
