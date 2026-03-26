@@ -50,6 +50,7 @@ User data (CSV/paste/demo)
 - Each dimension standardized to z-scores (subtract mean, divide by SD)
 - Euclidean distance (default): `d(i,j) = sqrt(sum((z_i - z_j)^2))`
 - Mahalanobis distance (option): `d(i,j) = sqrt((z_i - z_j)^T S^{-1} (z_i - z_j))` where S is the covariance matrix of the selected dimensions
+- **Fallback:** If k ≤ number of selected dimensions (singular covariance matrix), automatically fall back to Euclidean with a console warning
 - Output: symmetric k×k matrix, k = number of studies
 
 ### 3.2 Persistent Homology (Vietoris-Rips Filtration)
@@ -178,6 +179,7 @@ Expected output: TDA recovers 2 clusters with >90% accuracy. Between-cluster Q-t
 - Between-cluster Q-test: Q = X, df = K-1, p = Y
 - Covariate profile table: mean ± SD of each input dimension per cluster
 - Text summary: "TDA identified K topologically distinct subgroups. Between-cluster heterogeneity: Q = X, df = K-1, p = Y"
+- **Exploratory warning:** "Note: TDA subgroup discovery is exploratory (hypothesis-generating). Clusters are data-driven and should be validated in independent datasets before informing clinical decisions."
 
 ### Tab 5 — Export
 
