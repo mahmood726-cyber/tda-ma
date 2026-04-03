@@ -2659,6 +2659,15 @@ function generateRCodePreview() {
   }
 }
 
+/** Sanitize a CSV cell to prevent formula injection in Excel/Sheets.
+ *  Prepends ' to cells starting with =, +, @, \t, \r (NOT - per data rules). */
+function sanitizeCSVCell(val) {
+  if (val == null) return '';
+  const s = String(val);
+  if (s.length > 0 && '=+@\t\r'.includes(s[0])) return "'" + s;
+  return s;
+}
+
 function exportCSV() {
   if (!tdaResults) return;
   const r = tdaResults;
@@ -2666,9 +2675,9 @@ function exportCSV() {
   let csv = [...cols, 'tda_cluster'].join(',') + '\n';
   r.studies.forEach((s, i) => {
     const vals = cols.map(c => {
-      const v = s[c];
+      const v = sanitizeCSVCell(s[c]);
       if (typeof v === 'string' && v.includes(',')) return '"' + v.replace(/"/g, '""') + '"';
-      return v ?? '';
+      return v;
     });
     vals.push(r.clusterAssignment[i] + 1);
     csv += vals.join(',') + '\n';
