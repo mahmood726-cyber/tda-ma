@@ -164,7 +164,7 @@ The source code is freely available at https://github.com/mahmood726-cyber/tda-m
 
 ## Funding
 
-[FUNDING_PLACEHOLDER]
+[No external funding.]
 
 ## Competing Interests
 
